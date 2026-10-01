@@ -1,11 +1,23 @@
 <script>
+	import { resolve } from '$app/paths';
 	import ChatTranscriptView from '$lib/components/ChatTranscriptView.svelte';
 	import {
 		countDialogMessages,
 		formatRecordShortDate,
 		formatSavedDateLong,
+		getSessionAiSettingsView,
 		splitSessionMessages
 	} from '$lib/realtime/conversationRecords.js';
+	import {
+		estimateCost,
+		formatDuration,
+		formatTokenCount,
+		formatKrw,
+		formatUsd,
+		hasMeasuredUsage,
+		realtimeTokenTotal,
+		usageTimes
+	} from '$lib/realtime/realtimeUsage.js';
 
 	/** @typedef {import('$lib/realtime/conversationRecords.js').SavedConversation} SavedConversation */
 
@@ -17,12 +29,20 @@
 		onRefresh,
 		onToggleExpand,
 		onEdit,
-		onDelete
+		onDelete,
+		exchange = null
 	} = $props();
 </script>
 
 <div class="flex items-center justify-between gap-3 border-b border-[#b8d4f0]/80 pb-3">
 	<h2 class="text-[16px] font-bold text-[#111827]">대화 기록</h2>
+	<div class="flex items-center gap-2">
+		<a
+			class="shrink-0 text-[13px] font-semibold text-[#4a90e2] hover:underline"
+			href={resolve('/usage')}
+		>
+			사용량
+		</a>
 	<button
 		type="button"
 		class="shrink-0 rounded-lg border border-[#4a90e2] px-3 py-1.5 text-[13px] font-semibold text-[#4a90e2] transition hover:bg-[#eff6ff] disabled:opacity-50"
@@ -31,6 +51,7 @@
 	>
 		새로고침
 	</button>
+	</div>
 </div>
 
 {#if error}
@@ -47,6 +68,7 @@
 			{@const expanded = expandedIds[entry.id] === true}
 			{@const { dialog, system } = splitSessionMessages(entry.messages)}
 			{@const dialogCount = countDialogMessages(entry)}
+			{@const aiSettings = getSessionAiSettingsView(entry)}
 			<article class="overflow-hidden rounded-xl border border-[#e5e7eb] bg-white shadow-sm">
 				<header class="border-b border-[#f3f4f6] px-4 py-3">
 					<div class="flex items-start justify-between gap-2">
@@ -73,6 +95,58 @@
 								</svg>
 								{dialogCount}개 메시지
 							</p>
+							{#if entry.usage && (hasMeasuredUsage(entry.usage) || entry.usage.durationMs > 0)}
+								{@const times = usageTimes(entry.usage)}
+								{@const costUsd = estimateCost(entry.usage).totalUsd}
+								<p class="mt-1 text-[12px] font-medium text-[#1d4ed8]">
+									사용 시간 {formatDuration(times.sessionMs)}
+									· 내 발화 {formatDuration(times.userSpeechMs)}
+									· AI 음성 {formatDuration(times.assistantSpeechMs)}
+								</p>
+								<p class="mt-0.5 text-[12px] text-[#475569]">
+									토큰 {formatTokenCount(realtimeTokenTotal(entry.usage))}
+									· 예상 요금 {exchange
+										? `${formatKrw(costUsd, exchange.rate)} (${formatUsd(costUsd)})`
+										: formatUsd(costUsd)}
+								</p>
+							{:else}
+								<p class="mt-1 text-[12px] text-[#9ca3af]">사용량 기록 없음</p>
+							{/if}
+							<div class="mt-2.5">
+								<p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-[#9ca3af]">
+									AI 설정
+								</p>
+								<div class="flex flex-wrap gap-1.5">
+									<span
+										class="inline-flex max-w-full items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-semibold {aiSettings.hasStoredPersonality
+											? 'bg-[#eff6ff] text-[#1d4ed8]'
+											: 'bg-[#f3f4f6] text-[#6b7280]'}"
+									>
+										<span aria-hidden="true">{aiSettings.personality.emoji}</span>
+										<span class="truncate">{aiSettings.personality.title}</span>
+									</span>
+									<span
+										class="inline-flex rounded-full bg-[#f3f4f6] px-2.5 py-1 text-[11px] font-medium text-[#475569]"
+									>
+										{aiSettings.levelLabel}
+									</span>
+									<span
+										class="inline-flex rounded-full bg-[#f3f4f6] px-2.5 py-1 text-[11px] font-medium text-[#475569]"
+									>
+										{aiSettings.langLabel}
+									</span>
+									<span
+										class="inline-flex rounded-full bg-[#f3f4f6] px-2.5 py-1 text-[11px] font-medium text-[#475569]"
+									>
+										VAD {aiSettings.vadLabel}
+									</span>
+								</div>
+								{#if !aiSettings.hasStoredPersonality}
+									<p class="mt-1 text-[10px] text-[#9ca3af]">
+										이전 버전에서 저장된 기록이라 선생님 성격은 표시되지 않을 수 있습니다.
+									</p>
+								{/if}
+							</div>
 						</div>
 						<div class="flex shrink-0 items-center gap-1">
 							<button
@@ -126,6 +200,14 @@
 
 				{#if expanded}
 					<div class="px-4 py-4">
+						{#if entry.teacherPersonality === 'custom' && entry.customPromptText}
+							<div class="mb-4 rounded-xl border border-[#e5e7eb] bg-[#f9fafb] px-3 py-2.5">
+								<p class="text-[11px] font-semibold text-[#64748b]">저장된 직접 작성 프롬프트</p>
+								<p class="mt-1 line-clamp-4 text-[12px] leading-relaxed text-[#374151]">
+									{entry.customPromptText}
+								</p>
+							</div>
+						{/if}
 						<ChatTranscriptView
 							savedAt={entry.savedAt}
 							dialogMessages={dialog}

@@ -1,8 +1,19 @@
+import {
+	LEVEL_LABELS,
+	LANGUAGE_META,
+	VAD_PRESET_META
+} from './tutorLevels.js';
+import { getTeacherPersonalityDisplay } from './tutorPersonalities.js';
+import { normalizeTurnUsage, normalizeUsage } from './realtimeUsage.js';
+
 /**
- * @typedef {{ role: 'user' | 'assistant' | 'system', text: string }} ChatMessage
- * @typedef {{ id: string, savedAt: string, level: string, vadPreset: string, languageMode?: string, messages: ChatMessage[] }} SavedConversation
- * @typedef {{ savedAt: string, level: string, vadPreset: string, languageMode?: string, messages: ChatMessage[] }} ConversationInsertPayload
- * @typedef {{ role: 'user' | 'assistant', text: string }} DialogMessage
+ * @typedef {import('./realtimeUsage.js').RealtimeUsage} RealtimeUsage
+ * @typedef {import('./realtimeUsage.js').MessageTurnUsage} MessageTurnUsage
+ * @typedef {{ role: 'user' | 'assistant' | 'system', text: string, turnUsage?: MessageTurnUsage | null }} ChatMessage
+ * @typedef {import('./tutorPersonalities.js').TeacherPersonalityId} TeacherPersonalityId
+ * @typedef {{ id: string, savedAt: string, level: string, vadPreset: string, languageMode?: string, teacherPersonality?: TeacherPersonalityId, customPromptText?: string, messages: ChatMessage[], usage?: RealtimeUsage | null }} SavedConversation
+ * @typedef {{ savedAt: string, level: string, vadPreset: string, languageMode?: string, teacherPersonality?: TeacherPersonalityId, customPromptText?: string, messages: ChatMessage[], usage?: RealtimeUsage | null }} ConversationInsertPayload
+ * @typedef {{ role: 'user' | 'assistant', text: string, turnUsage?: MessageTurnUsage | null }} DialogMessage
  */
 
 const TECH_SYSTEM_PATTERN =
@@ -20,7 +31,8 @@ export function splitSessionMessages(messages) {
 		if (!m || typeof m.text !== 'string') continue;
 		if (m.role === 'system') system.push({ role: 'system', text: m.text });
 		else if (m.role === 'user' || m.role === 'assistant') {
-			dialog.push({ role: m.role, text: m.text });
+			const turnUsage = normalizeTurnUsage(m.turnUsage);
+			dialog.push(turnUsage ? { role: m.role, text: m.text, turnUsage } : { role: m.role, text: m.text });
 		}
 	}
 	return { dialog, system };
@@ -31,6 +43,34 @@ export function splitSessionMessages(messages) {
  */
 export function countDialogMessages(entry) {
 	return entry.messages.filter((m) => m.role === 'user' || m.role === 'assistant').length;
+}
+
+/** @param {SavedConversation} entry */
+export function getSessionAiSettingsView(entry) {
+	const personality = getTeacherPersonalityDisplay(entry.teacherPersonality ?? 'friendly');
+	const languageMode = entry.languageMode;
+	const langLabel =
+		languageMode === 'english' || languageMode === 'korean' || languageMode === 'mixed'
+			? LANGUAGE_META[languageMode].label
+			: '—';
+	const levelKey = entry.level;
+	const levelLabel =
+		levelKey === 'beginner' || levelKey === 'intermediate' || levelKey === 'advanced'
+			? LEVEL_LABELS[levelKey]
+			: entry.level;
+	const vadKey = entry.vadPreset;
+	const vadLabel =
+		vadKey === 'fast' || vadKey === 'balanced' || vadKey === 'patient'
+			? VAD_PRESET_META[vadKey].label
+			: entry.vadPreset;
+
+	return {
+		personality,
+		levelLabel,
+		langLabel,
+		vadLabel,
+		hasStoredPersonality: Boolean(entry.teacherPersonality)
+	};
 }
 
 /** @param {string} iso */
@@ -150,14 +190,20 @@ export function filterUserFacingSystemMessages(messages) {
  *   level: string,
  *   vadPreset: string,
  *   languageMode?: string,
+ *   teacherPersonality?: TeacherPersonalityId,
+ *   customPromptText?: string,
  *   dialogMessages: DialogMessage[],
- *   systemMessages?: ChatMessage[]
+ *   systemMessages?: ChatMessage[],
+ *   usage?: RealtimeUsage | null
  * }} input
  * @returns {ConversationInsertPayload}
  */
 export function buildConversationInsertPayload(input) {
 	/** @type {ChatMessage[]} */
-	const messages = input.dialogMessages.map((m) => ({ role: m.role, text: m.text }));
+	const messages = input.dialogMessages.map((m) => {
+		const turnUsage = normalizeTurnUsage(m.turnUsage);
+		return turnUsage ? { role: m.role, text: m.text, turnUsage } : { role: m.role, text: m.text };
+	});
 
 	for (const item of input.systemMessages ?? []) {
 		if (item.role !== 'system' || typeof item.text !== 'string') continue;
@@ -170,7 +216,10 @@ export function buildConversationInsertPayload(input) {
 		level: input.level,
 		vadPreset: input.vadPreset,
 		languageMode: input.languageMode,
-		messages
+		teacherPersonality: input.teacherPersonality,
+		customPromptText: input.customPromptText,
+		messages,
+		usage: normalizeUsage(input.usage)
 	};
 }
 
@@ -185,7 +234,10 @@ export function payloadToInsertRow(userId, payload) {
 		level: payload.level,
 		vad_preset: payload.vadPreset,
 		language_mode: payload.languageMode ?? null,
-		messages: payload.messages
+		teacher_personality: payload.teacherPersonality ?? 'friendly',
+		custom_prompt_text: payload.customPromptText?.trim() || null,
+		messages: payload.messages,
+		usage: normalizeUsage(payload.usage)
 	};
 }
 
@@ -196,18 +248,32 @@ export function payloadToInsertRow(userId, payload) {
  *   level: string,
  *   vad_preset: string,
  *   language_mode?: string | null,
- *   messages?: unknown
+ *   teacher_personality?: string | null,
+ *   custom_prompt_text?: string | null,
+ *   messages?: unknown,
+ *   usage?: unknown
  * }} row
  * @returns {SavedConversation}
  */
 export function rowToSavedConversation(row) {
+	const personality = row.teacher_personality;
 	return {
 		id: row.id,
 		savedAt: row.saved_at,
 		level: row.level,
 		vadPreset: row.vad_preset,
 		languageMode: row.language_mode ?? undefined,
-		messages: normalizeMessages(row.messages)
+		teacherPersonality:
+			personality === 'friendly' ||
+			personality === 'strict' ||
+			personality === 'business' ||
+			personality === 'casual' ||
+			personality === 'custom'
+				? personality
+				: undefined,
+		customPromptText: row.custom_prompt_text ?? undefined,
+		messages: normalizeMessages(row.messages),
+		usage: normalizeUsage(row.usage)
 	};
 }
 
@@ -224,7 +290,10 @@ function normalizeMessages(raw) {
 			(role === 'user' || role === 'assistant' || role === 'system') &&
 			typeof text === 'string'
 		) {
-			out.push({ role, text });
+			const turnUsage = normalizeTurnUsage(
+				/** @type {{ turnUsage?: unknown }} */ (item).turnUsage
+			);
+			out.push(turnUsage ? { role, text, turnUsage } : { role, text });
 		}
 	}
 	return out;

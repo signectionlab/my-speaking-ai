@@ -2,6 +2,7 @@ import { createServerClient } from '@supabase/ssr';
 import { json, redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { env as publicEnv } from '$env/dynamic/public';
+import { isOnboardingExemptPath, readOnboardingComplete } from '$lib/server/onboarding.js';
 import { resolveSupabaseConfig } from '$lib/server/supabaseConfig.js';
 
 const PUBLIC_PAGES = new Set(['/login', '/signup']);
@@ -13,7 +14,13 @@ function isSkippable(pathname) {
 
 /** @param {string} pathname */
 function isProtectedPath(pathname) {
-	return pathname === '/' || pathname.startsWith('/live') || pathname.startsWith('/api/');
+	return (
+		pathname === '/' ||
+		pathname === '/account' ||
+		pathname === '/usage' ||
+		pathname.startsWith('/live') ||
+		pathname.startsWith('/api/')
+	);
 }
 
 /** @param {import('@sveltejs/kit').Cookies} cookies */
@@ -81,7 +88,35 @@ export async function handle({ event, resolve }) {
 		redirect(303, `/login${next}`);
 	}
 
+	let onboardingComplete = true;
+	if (event.locals.user && event.locals.supabase && !isSkippable(pathname)) {
+		onboardingComplete = await readOnboardingComplete(event.locals.supabase, event.locals.user.id);
+	}
+
+	if (
+		event.locals.user &&
+		!onboardingComplete &&
+		!isOnboardingExemptPath(pathname) &&
+		!isSkippable(pathname)
+	) {
+		if (pathname.startsWith('/api/')) {
+			return json(
+				{ ok: false, error: '서비스 이용 동의 및 프로필 입력이 필요합니다.' },
+				{ status: 403 }
+			);
+		}
+		const next =
+			pathname === '/onboarding'
+				? ''
+				: `?redirect=${encodeURIComponent(pathname + event.url.search)}`;
+		redirect(303, `/onboarding${next}`);
+	}
+
 	if (event.locals.user && PUBLIC_PAGES.has(pathname)) {
+		redirect(303, onboardingComplete ? '/' : '/onboarding');
+	}
+
+	if (event.locals.user && onboardingComplete && pathname === '/onboarding') {
 		redirect(303, '/');
 	}
 

@@ -4,9 +4,10 @@
 		filterUserFacingSystemMessages,
 		parseSystemMessageText
 	} from '$lib/realtime/conversationRecords.js';
+	import { formatTurnUsageLines } from '$lib/realtime/realtimeUsage.js';
 
 	/**
-	 * @typedef {{ role: 'user' | 'assistant', text: string }} DialogMessage
+	 * @typedef {{ role: 'user' | 'assistant', text: string, turnUsage?: import('$lib/realtime/realtimeUsage.js').MessageTurnUsage | null }} DialogMessage
 	 * @typedef {{ role: 'system', text: string }} SystemMessage
 	 */
 
@@ -15,17 +16,29 @@
 		dialogMessages = [],
 		systemMessages = [],
 		emptyText = '대화가 시작되면 말한 순서대로 여기에 표시됩니다.',
-		compact = false
+		compact = false,
+		liveUserModel = '',
+		liveAssistantModel = '',
+		pendingAssistantText = ''
 	} = $props();
 
 	const clockBase = $derived(savedAt || new Date().toISOString());
 	const displaySystemMessages = $derived(filterUserFacingSystemMessages(systemMessages));
+	const pendingText = $derived(pendingAssistantText.trim());
+
+	/**
+	 * @param {DialogMessage} message
+	 */
+	function shownModel(message) {
+		if (message.role === 'user') return message.turnUsage?.inputModel || liveUserModel || '';
+		return message.turnUsage?.outputModel || liveAssistantModel || '';
+	}
 </script>
 
-{#if dialogMessages.length === 0 && displaySystemMessages.length === 0}
+{#if dialogMessages.length === 0 && displaySystemMessages.length === 0 && !pendingText}
 	<p class="py-8 text-center text-[13px] text-[#999999]">{emptyText}</p>
 {:else}
-	{#if dialogMessages.length > 0}
+	{#if dialogMessages.length > 0 || pendingText}
 		<section class={compact ? 'mt-3' : ''}>
 			<h3 class="mb-3 flex items-center gap-2 text-[13px] font-semibold text-[#374151]">
 				<svg class="h-4 w-4 text-[#6b7280]" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -46,6 +59,7 @@
 			</h3>
 			<ul class="space-y-4">
 				{#each dialogMessages as m, i (i)}
+					{@const usageLines = formatTurnUsageLines(m.turnUsage)}
 					<li class="flex gap-2.5">
 						{#if m.role === 'user'}
 							<span
@@ -55,6 +69,9 @@
 							<div class="min-w-0 flex-1">
 								<p class="mb-1 text-[12px] font-medium text-[#374151]">
 									나
+									{#if shownModel(m)}
+										<span class="ml-1 font-semibold text-[#4a90e2]">{shownModel(m)}</span>
+									{/if}
 									<span class="ml-1 font-normal text-[#9ca3af]">{dialogMessageClock(clockBase, i)}</span>
 								</p>
 								<p
@@ -62,6 +79,12 @@
 								>
 									{m.text}
 								</p>
+								{#if usageLines.length > 0}
+									<p class="mt-1.5 text-[11px] leading-relaxed text-[#64748b]">
+										{usageLines[0]}<br />
+										{usageLines[1]}
+									</p>
+								{/if}
 							</div>
 						{:else}
 							<span
@@ -71,6 +94,9 @@
 							<div class="min-w-0 flex-1">
 								<p class="mb-1 text-[12px] font-medium text-[#374151]">
 									AI 선생님
+									{#if shownModel(m)}
+										<span class="ml-1 font-semibold text-[#16a34a]">{shownModel(m)}</span>
+									{/if}
 									<span class="ml-1 font-normal text-[#9ca3af]">{dialogMessageClock(clockBase, i)}</span>
 								</p>
 								<p
@@ -78,10 +104,38 @@
 								>
 									{m.text}
 								</p>
+								{#if usageLines.length > 0}
+									<p class="mt-1.5 text-[11px] leading-relaxed text-[#64748b]">
+										{usageLines[0]}<br />
+										{usageLines[1]}
+									</p>
+								{/if}
 							</div>
 						{/if}
 					</li>
 				{/each}
+				{#if pendingText}
+					<li class="flex gap-2.5">
+						<span
+							class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#22c55e] text-[10px] font-bold text-white"
+							aria-hidden="true"
+						>AI</span>
+						<div class="min-w-0 flex-1">
+							<p class="mb-1 text-[12px] font-medium text-[#374151]">
+								AI 선생님
+								{#if liveAssistantModel}
+									<span class="ml-1 font-semibold text-[#16a34a]">{liveAssistantModel}</span>
+								{/if}
+								<span class="ml-1 font-normal text-[#9ca3af]">응답 중</span>
+							</p>
+							<p
+								class="inline-block max-w-full rounded-2xl rounded-tl-md bg-[#f3f4f6] px-3.5 py-2.5 text-[13px] leading-relaxed text-[#1f2937]"
+							>
+								{pendingText}
+							</p>
+						</div>
+					</li>
+				{/if}
 			</ul>
 		</section>
 	{/if}

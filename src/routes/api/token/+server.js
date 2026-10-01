@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
-import { buildSessionConfig } from '$lib/realtime/tutorLevels.js';
+import { buildSessionConfig, normalizePromptStyles } from '$lib/realtime/tutorLevels.js';
+import { resolveSessionInstructions } from '$lib/realtime/tutorPersonalities.js';
 
 /** @param {string | undefined} level */
 function parseLevel(level) {
@@ -18,6 +19,14 @@ function parseVad(vad) {
 function parseLanguageMode(lang) {
 	if (lang === 'korean' || lang === 'mixed') return lang;
 	return 'english';
+}
+
+/** @param {string | undefined} value */
+function parsePersonality(value) {
+	if (value === 'strict' || value === 'business' || value === 'casual' || value === 'custom') {
+		return value;
+	}
+	return 'friendly';
 }
 
 /** @param {string} raw */
@@ -70,7 +79,17 @@ export async function POST({ request, locals }) {
 	const level = parseLevel(body.level);
 	const vadPreset = parseVad(body.vadPreset);
 	const languageMode = parseLanguageMode(body.languageMode);
-	const sessionConfig = buildSessionConfig(level, vadPreset, languageMode);
+	const personalityId = parsePersonality(body.teacherPersonality);
+	const customPromptText =
+		typeof body.customPromptText === 'string' ? body.customPromptText : '';
+	const instructions = resolveSessionInstructions({
+		level,
+		languageMode,
+		personalityId,
+		customPromptText,
+		promptStyles: normalizePromptStyles(languageMode, body.promptStyles)
+	});
+	const sessionConfig = buildSessionConfig(level, vadPreset, languageMode, instructions);
 
 	let res;
 	try {

@@ -1,11 +1,12 @@
+import {
+	normalizePromptStyles,
+	resolvePromptInstructionParts
+} from './tutorPromptFields.js';
+
 /** @typedef {'beginner' | 'intermediate' | 'advanced'} TutorLevel */
 /** @typedef {'fast' | 'balanced' | 'patient'} VadPreset */
 /** @typedef {'english' | 'korean' | 'mixed'} LanguageMode */
-
-const SHARED = [
-	'Keep spoken replies short (1–3 sentences) for low latency.',
-	'Be warm and encouraging. Ask one follow-up question to keep the conversation going.'
-];
+/** @typedef {import('./tutorPromptFields.js').PromptStyleSelection} PromptStyleSelection */
 
 /** @type {Record<TutorLevel, string>} */
 export const LEVEL_LABELS = {
@@ -45,42 +46,11 @@ export const VAD_PRESET_META = {
 };
 
 /**
- * @param {LanguageMode} languageMode
- * @returns {string[]}
- */
-function languageInstructions(languageMode) {
-	switch (languageMode) {
-		case 'korean':
-			return [
-				'You are a friendly Korean conversation tutor for a Korean learner.',
-				'Speak primarily in natural, clear Korean.',
-				'Gently correct grammar or word choice in Korean when helpful.',
-				'If the learner wants English study, explain in Korean and give short English examples.',
-				'Never force English unless the learner asks to practice English.'
-			];
-		case 'mixed':
-			return [
-				'You are a bilingual Korean–English conversation tutor.',
-				'If the user speaks Korean, respond in Korean. If the user speaks English, respond in English.',
-				'If they mix languages, match their mix naturally.',
-				'Offer light corrections in the language they are practicing.',
-				'For Korean turns: help fluency and natural phrasing. For English turns: help conversation and gentle correction.'
-			];
-		default:
-			return [
-				'You are a friendly English conversation tutor for a Korean learner.',
-				'Speak primarily in clear English at a level suited to the learner.',
-				'Gently correct important mistakes, then continue the chat.',
-				'Use brief Korean only when the learner is completely stuck.'
-			];
-	}
-}
-
-/**
  * @param {TutorLevel} level
  * @returns {string[]}
  */
-function levelInstructions(level) {
+/** @param {TutorLevel} level */
+export function levelInstructionParts(level) {
 	return {
 		beginner: [
 			'Use simple vocabulary and shorter sentences.',
@@ -100,13 +70,25 @@ function levelInstructions(level) {
 /**
  * @param {TutorLevel} level
  * @param {LanguageMode} languageMode
+ * @param {Partial<PromptStyleSelection>} [promptStyles]
  * @returns {string}
  */
-export function buildInstructions(level, languageMode) {
-	return [...languageInstructions(languageMode), ...SHARED, ...levelInstructions(level)].join(
+export function buildInstructions(level, languageMode, promptStyles) {
+	const styles = normalizePromptStyles(languageMode, promptStyles);
+	return [...resolvePromptInstructionParts(languageMode, styles), ...levelInstructionParts(level)].join(
 		' '
 	);
 }
+
+export {
+	PROMPT_FIELD_META,
+	PROMPT_STYLE_IDS,
+	PROMPT_STYLE_LABELS,
+	defaultPromptStyles,
+	defaultPromptStylesByMode,
+	normalizePromptStyles,
+	normalizePromptStylesByMode
+} from './tutorPromptFields.js';
 
 /**
  * @param {VadPreset} preset
@@ -140,17 +122,13 @@ export function buildTurnDetection(preset) {
 	}
 }
 
-/**
- * @param {TutorLevel} level
- * @param {VadPreset} vadPreset
- * @param {LanguageMode} languageMode
- */
-export function buildSessionConfig(level, vadPreset, languageMode) {
+/** @param {string} instructions */
+export function buildSessionConfig(level, vadPreset, languageMode, instructions) {
 	return {
 		session: {
 			type: 'realtime',
 			model: 'gpt-realtime-2.1',
-			instructions: buildInstructions(level, languageMode),
+			instructions,
 			audio: {
 				input: {
 					transcription: { model: 'whisper-1' },

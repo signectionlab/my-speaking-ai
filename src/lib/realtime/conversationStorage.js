@@ -1,7 +1,10 @@
 const PREFS_KEY = 'speaking-ai-realtime-prefs';
 
 /** @typedef {import('./conversationRecords.js').SavedConversation} SavedConversation */
-/** @typedef {{ level?: string, vadPreset?: string, languageMode?: string }} RealtimePrefs */
+/** @typedef {import('./tutorPromptFields.js').LanguageMode} LanguageMode */
+/** @typedef {import('./tutorPromptFields.js').PromptStyleSelection} PromptStyleSelection */
+/** @typedef {import('./tutorPersonalities.js').TeacherPersonalityId} TeacherPersonalityId */
+/** @typedef {{ level?: string, vadPreset?: string, languageMode?: string, teacherPersonality?: TeacherPersonalityId, customPromptByMode?: Partial<Record<LanguageMode, string>>, promptStylesByMode?: Partial<Record<LanguageMode, Partial<PromptStyleSelection>>> }} RealtimePrefs */
 
 /** @returns {RealtimePrefs} */
 export function loadPrefs() {

@@ -28,11 +28,30 @@
 			<span class="sm:hidden">AI 영어 회화</span>
 		</a>
 
-		<div class="flex items-center gap-3">
+		<div class="flex items-center gap-2 sm:gap-3">
 			{#if user}
-				<span class="hidden max-w-[160px] truncate text-[13px] text-[#6b7280] sm:inline">
-					{user.email}
-				</span>
+				<a
+					class="shrink-0 rounded-lg px-2.5 py-1.5 text-[13px] font-semibold text-[#334155] transition hover:bg-[#f1f5f9] hover:text-[#1d4ed8] {pathname ===
+					'/usage'
+						? 'bg-[#eff6ff] text-[#1d4ed8]'
+						: ''}"
+					href={resolve('/usage')}
+					aria-current={pathname === '/usage' ? 'page' : undefined}
+				>
+					사용량
+				</a>
+				<a
+					class="max-w-[9.5rem] truncate rounded-lg px-2.5 py-1.5 text-[13px] font-semibold text-[#334155] transition hover:bg-[#f1f5f9] hover:text-[#1d4ed8] sm:max-w-[180px] {pathname ===
+					'/account'
+						? 'bg-[#eff6ff] text-[#1d4ed8]'
+						: ''}"
+					href={resolve('/account')}
+					title="내 정보"
+					aria-current={pathname === '/account' ? 'page' : undefined}
+				>
+					<span class="sm:hidden">내 정보</span>
+					<span class="hidden truncate sm:inline">{user.email || '내 정보'}</span>
+				</a>
 				<form method="POST" action="/logout">
 					<button
 						type="submit"

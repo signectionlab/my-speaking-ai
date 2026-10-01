@@ -1,22 +1,45 @@
 <script>
 	import { onDestroy, onMount, tick } from 'svelte';
+	import AiTeacherSettingsPanel from '$lib/components/AiTeacherSettingsPanel.svelte';
 	import {
-		LEVEL_LABELS,
-		LEVEL_HINTS,
-		VAD_PRESET_META,
-		LANGUAGE_META
-	} from '$lib/realtime/tutorLevels.js';
+		defaultPromptStyles,
+		defaultPromptStylesByMode,
+		normalizePromptStyles,
+		normalizePromptStylesByMode
+	} from '$lib/realtime/tutorPromptFields.js';
+	import {
+		DEFAULT_CUSTOM_PROMPT_KO,
+		applyPersonalityToStyles,
+		previewPromptKo
+	} from '$lib/realtime/tutorPersonalities.js';
 	import ChatTranscriptView from '$lib/components/ChatTranscriptView.svelte';
 	import ConversationHistoryPanel from '$lib/components/ConversationHistoryPanel.svelte';
 	import { createConversation, deleteConversation, fetchConversations } from '$lib/realtime/conversationApi.js';
+	import {
+		createSavedPrompt,
+		deleteSavedPrompt,
+		fetchUserPrompts,
+		savePromptDraft
+	} from '$lib/realtime/promptApi.js';
 	import {
 		buildConversationInsertPayload,
 		createUserSystemMessage,
 		filterUserFacingSystemMessages,
 		formatSavedDateLong,
+		getSessionAiSettingsView,
 		splitSessionMessages
 	} from '$lib/realtime/conversationRecords.js';
 	import { loadPrefs, savePrefs } from '$lib/realtime/conversationStorage.js';
+	import {
+		addResponseUsage,
+		addTranscriptionUsage,
+		createEmptyUsage,
+		describeResponseTurn,
+		describeTranscriptionTurn,
+		REALTIME_MODEL,
+		TRANSCRIPTION_MODEL,
+		withDuration
+	} from '$lib/realtime/realtimeUsage.js';
 	import {
 		SESSION_CLOSE_TIMEOUT_MS,
 		verifyLocalTeardown
@@ -51,11 +74,26 @@
 	let level = $state('beginner');
 	let vadPreset = $state('fast');
 	let languageMode = $state('english');
+	/** @type {Record<import('$lib/realtime/tutorPromptFields.js').LanguageMode, import('$lib/realtime/tutorPromptFields.js').PromptStyleSelection>} */
+	let promptStylesByMode = $state(defaultPromptStylesByMode());
+	/** @type {import('$lib/realtime/tutorPersonalities.js').TeacherPersonalityId} */
+	let teacherPersonality = $state('friendly');
+	/** @type {Record<import('$lib/realtime/tutorPromptFields.js').LanguageMode, string>} */
+	let customPromptByMode = $state({ english: '', korean: '', mixed: '' });
+	let showCustomPromptEditor = $state(false);
+	/** @type {import('$lib/realtime/promptApi.js').SavedPrompt[]} */
+	let savedPrompts = $state([]);
+	let promptCloudStatus = $state('');
+	let promptCloudError = $state('');
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let draftSaveTimer = null;
 
 	/** @type {Array<{ role: 'user' | 'assistant', text: string }>} */
 	let messages = $state([]);
 	let history = $state([]);
-	/** @type {'current' | 'history'} */
+	/** @type {{ rate: number, date: string } | null} */
+	let usdKrw = $state(null);
+	/** @type {'current' | 'history' | 'settings'} */
 	let chatPanelTab = $state('current');
 	/** @type {Record<string, boolean>} */
 	let expandedHistoryIds = $state({});
@@ -64,7 +102,11 @@
 	let saveError = $state('');
 	let lastSavedId = $state('');
 	let viewingSavedAt = $state('');
+	/** @type {ReturnType<typeof getSessionAiSettingsView> | null} */
+	let viewingAiSettings = $state(null);
 	let sessionStartedAt = $state('');
+	/** @type {import('$lib/realtime/realtimeUsage.js').RealtimeUsage} */
+	let sessionUsage = $state(createEmptyUsage());
 	let sessionDebugLogStart = $state(0);
 	/** @type {import('$lib/realtime/conversationRecords.js').ChatMessage[]} */
 	let sessionSystemMessages = $state([]);
@@ -83,12 +125,8 @@
 	let animationFrameId = null;
 
 	let assistantIndex = -1;
-	/** @type {string} */
-	let pendingAssistant = '';
-
-	const levels = /** @type {const} */ (['beginner', 'intermediate', 'advanced']);
-	const vadPresets = /** @type {const} */ (['fast', 'balanced', 'patient']);
-	const languageModes = /** @type {const} */ (['english', 'korean', 'mixed']);
+	let pendingResponseMessageIndex = -1;
+	let pendingAssistant = $state('');
 
 	const BAR_COUNT = 72;
 	const WAVE_COLOR = '#4a90e2';
@@ -96,6 +134,17 @@
 		status === 'connecting' || status === 'live' || status === 'ending'
 	);
 	const settingsLocked = $derived(isSessionActive);
+	const activeCustomPrompt = $derived(customPromptByMode[languageMode] ?? '');
+	const settingsPreviewText = $derived(
+		previewPromptKo({
+			personalityId: teacherPersonality,
+			customPromptText: activeCustomPrompt,
+			languageMode
+		})
+	);
+	const savedPromptsForMode = $derived(
+		savedPrompts.filter((p) => p.languageMode === languageMode)
+	);
 
 	/** @type {'idle' | 'waiting' | 'connected'} */
 	const apiLinkState = $derived.by(() => {
@@ -115,14 +164,153 @@
 		if (prefs.languageMode === 'english' || prefs.languageMode === 'korean' || prefs.languageMode === 'mixed') {
 			languageMode = prefs.languageMode;
 		}
+		promptStylesByMode = normalizePromptStylesByMode(prefs.promptStylesByMode);
+		if (
+			prefs.teacherPersonality === 'friendly' ||
+			prefs.teacherPersonality === 'strict' ||
+			prefs.teacherPersonality === 'business' ||
+			prefs.teacherPersonality === 'casual' ||
+			prefs.teacherPersonality === 'custom'
+		) {
+			teacherPersonality = prefs.teacherPersonality;
+		}
+		if (prefs.customPromptByMode && typeof prefs.customPromptByMode === 'object') {
+			customPromptByMode = {
+				english: String(prefs.customPromptByMode.english ?? ''),
+				korean: String(prefs.customPromptByMode.korean ?? ''),
+				mixed: String(prefs.customPromptByMode.mixed ?? '')
+			};
+		}
 		void refreshHistory();
+		void loadUserPromptsFromCloud();
 		logDebug('info', '디버그 패널 준비됨', { href: location.href });
 		window.addEventListener('resize', handleResize);
 		return () => window.removeEventListener('resize', handleResize);
 	});
 
 	function persistPrefs() {
-		savePrefs({ level, vadPreset, languageMode });
+		savePrefs({
+			level,
+			vadPreset,
+			languageMode,
+			teacherPersonality,
+			customPromptByMode,
+			promptStylesByMode: normalizePromptStylesByMode(promptStylesByMode)
+		});
+	}
+
+	/** @param {import('$lib/realtime/tutorPersonalities.js').TeacherPersonalityId} id */
+	function selectTeacherPersonality(id) {
+		teacherPersonality = id;
+		showCustomPromptEditor = id === 'custom';
+		promptStylesByMode = {
+			...promptStylesByMode,
+			[languageMode]: applyPersonalityToStyles(id, languageMode)
+		};
+		persistPrefs();
+	}
+
+	function openCustomPromptEditor() {
+		teacherPersonality = 'custom';
+		showCustomPromptEditor = true;
+		if (!customPromptByMode[languageMode]?.trim()) {
+			customPromptByMode = {
+				...customPromptByMode,
+				[languageMode]: DEFAULT_CUSTOM_PROMPT_KO
+			};
+		}
+		persistPrefs();
+	}
+
+	/** @param {string} value */
+	function updateCustomPrompt(value) {
+		customPromptByMode = { ...customPromptByMode, [languageMode]: value };
+		teacherPersonality = 'custom';
+		persistPrefs();
+		schedulePromptDraftSave();
+	}
+
+	async function loadUserPromptsFromCloud() {
+		promptCloudError = '';
+		try {
+			const bundle = await fetchUserPrompts();
+			savedPrompts = bundle.saved;
+			customPromptByMode = {
+				english: bundle.drafts.english?.content ?? customPromptByMode.english,
+				korean: bundle.drafts.korean?.content ?? customPromptByMode.korean,
+				mixed: bundle.drafts.mixed?.content ?? customPromptByMode.mixed
+			};
+			persistPrefs();
+		} catch (err) {
+			promptCloudError =
+				err instanceof Error ? err.message : '클라우드 프롬프트를 불러오지 못했습니다.';
+		}
+	}
+
+	function schedulePromptDraftSave() {
+		if (draftSaveTimer !== null) clearTimeout(draftSaveTimer);
+		draftSaveTimer = setTimeout(() => {
+			void persistPromptDraftToCloud();
+		}, 900);
+	}
+
+	async function persistPromptDraftToCloud() {
+		promptCloudError = '';
+		try {
+			await savePromptDraft(languageMode, customPromptByMode[languageMode] ?? '');
+			promptCloudStatus = '작성 중인 프롬프트가 계정에 저장되었습니다.';
+		} catch (err) {
+			promptCloudError =
+				err instanceof Error ? err.message : '프롬프트 초안 저장에 실패했습니다.';
+		}
+	}
+
+	/** @param {string} title */
+	async function saveNamedPromptToCloud(title) {
+		promptCloudError = '';
+		promptCloudStatus = '';
+		try {
+			await createSavedPrompt({
+				title,
+				languageMode,
+				content: customPromptByMode[languageMode] ?? ''
+			});
+			await loadUserPromptsFromCloud();
+			promptCloudStatus = '「' + title.trim() + '」 프롬프트를 저장했습니다.';
+		} catch (err) {
+			promptCloudError = err instanceof Error ? err.message : '프롬프트 저장에 실패했습니다.';
+		}
+	}
+
+	/** @param {import('$lib/realtime/promptApi.js').SavedPrompt} item */
+	function loadSavedPromptFromCloud(item) {
+		customPromptByMode = { ...customPromptByMode, [item.languageMode]: item.content };
+		languageMode = item.languageMode;
+		teacherPersonality = 'custom';
+		showCustomPromptEditor = true;
+		persistPrefs();
+		void persistPromptDraftToCloud();
+		promptCloudStatus = '「' + item.title + '」 프롬프트를 불러왔습니다.';
+	}
+
+	/** @param {string} id */
+	async function deleteSavedPromptFromCloud(id) {
+		promptCloudError = '';
+		try {
+			await deleteSavedPrompt(id);
+			savedPrompts = savedPrompts.filter((p) => p.id !== id);
+			promptCloudStatus = '저장 프롬프트를 삭제했습니다.';
+		} catch (err) {
+			promptCloudError = err instanceof Error ? err.message : '프롬프트 삭제에 실패했습니다.';
+		}
+	}
+
+	function resetTeacherSettings() {
+		teacherPersonality = 'friendly';
+		showCustomPromptEditor = false;
+		customPromptByMode = { english: '', korean: '', mixed: '' };
+		promptStylesByMode = defaultPromptStylesByMode();
+		persistPrefs();
 	}
 
 	function redactSecrets(value) {
@@ -167,7 +355,6 @@
 				detail: text
 			}
 		];
-		if (levelName === 'error') showDebug = true;
 		tick().then(() => {
 			if (debugScrollEl) debugScrollEl.scrollTop = debugScrollEl.scrollHeight;
 		});
@@ -217,11 +404,23 @@
 		});
 	}
 
-	function appendMessage(/** @type {'user' | 'assistant'} */ role, /** @type {string} */ text) {
-		messages = [...messages, { role, text }];
+	function appendMessage(
+		/** @type {'user' | 'assistant'} */ role,
+		/** @type {string} */ text,
+		/** @type {import('$lib/realtime/realtimeUsage.js').MessageTurnUsage | null} */ turnUsage = null
+	) {
+		messages = [...messages, turnUsage ? { role, text, turnUsage } : { role, text }];
 		const idx = messages.length - 1;
 		scrollChatToBottom();
 		return idx;
+	}
+
+	function attachTurnUsage(
+		/** @type {number} */ index,
+		/** @type {import('$lib/realtime/realtimeUsage.js').MessageTurnUsage | null} */ turnUsage
+	) {
+		if (!turnUsage || index < 0 || index >= messages.length) return;
+		messages = messages.map((m, i) => (i === index ? { ...m, turnUsage } : m));
 	}
 
 	function updateMessage(/** @type {number} */ index, /** @type {string} */ text) {
@@ -236,10 +435,13 @@
 			return;
 		}
 		assistantIndex = appendMessage('assistant', pendingAssistant.trim());
+		pendingResponseMessageIndex = assistantIndex;
 		pendingAssistant = '';
 	}
 
-	function handleServerEvent(/** @type {{ type: string, delta?: string, transcript?: string, error?: { message?: string } }} */ event) {
+	function handleServerEvent(
+		/** @type {{ type: string, delta?: string, transcript?: string, usage?: unknown, response?: { usage?: unknown, model?: string }, error?: { message?: string } }} */ event
+	) {
 		switch (event.type) {
 			case 'response.output_audio_transcript.delta': {
 				const delta = event.delta ?? '';
@@ -247,28 +449,48 @@
 					updateMessage(assistantIndex, (messages[assistantIndex]?.text ?? '') + delta);
 				} else if (pendingAssistant || delta) {
 					pendingAssistant += delta;
+					scrollChatToBottom();
 				}
 				break;
 			}
 			case 'response.output_audio_transcript.done': {
 				if (assistantIndex === -1 && pendingAssistant.trim()) {
 					flushPendingAssistant();
+				} else if (assistantIndex >= 0) {
+					pendingResponseMessageIndex = assistantIndex;
 				}
 				assistantIndex = -1;
 				pendingAssistant = '';
 				break;
 			}
 			case 'response.done': {
+				if (event.response?.usage) sessionUsage = addResponseUsage(sessionUsage, event.response.usage);
 				if (assistantIndex === -1 && pendingAssistant.trim()) {
 					flushPendingAssistant();
+				} else if (assistantIndex >= 0) {
+					pendingResponseMessageIndex = assistantIndex;
 				}
+				const responseModel =
+					typeof event.response?.model === 'string' && event.response.model.trim()
+						? event.response.model.trim()
+						: REALTIME_MODEL;
+				attachTurnUsage(
+					pendingResponseMessageIndex,
+					describeResponseTurn(event.response?.usage ?? {}, responseModel)
+				);
 				assistantIndex = -1;
+				pendingResponseMessageIndex = -1;
 				break;
 			}
 			case 'conversation.item.input_audio_transcription.completed': {
+				if (event.usage) sessionUsage = addTranscriptionUsage(sessionUsage, event.usage);
 				const text = event.transcript?.trim();
 				if (!text) break;
-				appendMessage('user', text);
+				appendMessage(
+					'user',
+					text,
+					describeTranscriptionTurn(event.usage ?? {}, TRANSCRIPTION_MODEL)
+				);
 				logDebug('ok', '사용자 음성 전사 완료', text);
 				if (pendingAssistant.trim()) {
 					flushPendingAssistant();
@@ -433,6 +655,7 @@
 		dc = null;
 		pc = null;
 		assistantIndex = -1;
+		pendingResponseMessageIndex = -1;
 		pendingAssistant = '';
 		if (audioEl) audioEl.srcObject = null;
 		clearSessionCloseWait();
@@ -456,9 +679,12 @@
 		historyLoading = true;
 		historyError = '';
 		try {
-			history = await fetchConversations();
+			const listed = await fetchConversations();
+			history = listed.conversations;
+			usdKrw = listed.exchange;
 		} catch (err) {
 			history = [];
+			usdKrw = null;
 			historyError = err instanceof Error ? err.message : '대화 기록을 불러오지 못했습니다.';
 			logDebug('error', '대화 기록 불러오기 실패', historyError);
 		} finally {
@@ -493,13 +719,19 @@
 		if (messages.length === 0 && systemToSave.length === 0) return false;
 
 		saveError = '';
+		const started = Date.parse(sessionStartedAt);
+		const durationMs = Number.isNaN(started) ? 0 : Date.now() - started;
 		const payload = buildConversationInsertPayload({
 			sessionStartedAt: sessionStartedAt || new Date().toISOString(),
 			level,
 			vadPreset,
 			languageMode,
+			teacherPersonality,
+			customPromptText:
+				teacherPersonality === 'custom' ? (customPromptByMode[languageMode] ?? '') : undefined,
 			dialogMessages: messages,
-			systemMessages: systemToSave
+			systemMessages: systemToSave,
+			usage: withDuration(sessionUsage, durationMs)
 		});
 
 		try {
@@ -521,10 +753,13 @@
 		messages = [];
 		sessionSystemMessages = [];
 		viewingSavedAt = '';
+		viewingAiSettings = null;
 		lastSavedId = '';
 		sessionStartedAt = new Date().toISOString();
+		sessionUsage = createEmptyUsage();
 		sessionDebugLogStart = debugLogs.length;
 		assistantIndex = -1;
+		pendingResponseMessageIndex = -1;
 		pendingAssistant = '';
 		persistPrefs();
 		shutdownState = 'none';
@@ -550,7 +785,14 @@
 			const tokenRes = await fetch('/api/token', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ level, vadPreset, languageMode })
+				body: JSON.stringify({
+					level,
+					vadPreset,
+					languageMode,
+					teacherPersonality,
+					customPromptText: customPromptByMode[languageMode] ?? '',
+					promptStyles: normalizePromptStyles(languageMode, promptStylesByMode[languageMode])
+				})
 			});
 			const tokenBody = await readResponseBody(tokenRes);
 			const tokenMs = Math.round(performance.now() - tokenStarted);
@@ -812,6 +1054,7 @@
 				: 'english';
 		chatPanelTab = 'current';
 		viewingSavedAt = entry.savedAt;
+		viewingAiSettings = getSessionAiSettingsView(entry);
 		lastSavedId = entry.id;
 		statusText = `${formatSavedDateLong(entry.savedAt)} 세션 기록을 불러왔습니다.`;
 		scrollChatToBottom();
@@ -819,6 +1062,7 @@
 
 	function clearSavedSessionView() {
 		viewingSavedAt = '';
+		viewingAiSettings = null;
 		sessionSystemMessages = [];
 		messages = [];
 		statusText = 'AI 튜터 설정 후 대화를 시작해 주세요.';
@@ -830,12 +1074,13 @@
 		}
 	});
 
-	const debugErrorCount = $derived(debugLogs.filter((e) => e.level === 'error').length);
+	const sessionDebugCount = $derived(Math.max(0, debugLogs.length - sessionDebugLogStart));
 	const visibleDebugLogs = $derived(
 		debugErrorsOnly ? debugLogs.filter((e) => e.level === 'error' || e.level === 'warn') : debugLogs
 	);
 
 	onDestroy(() => {
+		if (draftSaveTimer !== null) clearTimeout(draftSaveTimer);
 		if (dc?.readyState === 'open') {
 			try {
 				dc.send(JSON.stringify({ type: 'session.close' }));
@@ -867,82 +1112,6 @@
 			{errorMessage}
 		</div>
 	{/if}
-
-	<div class="mx-auto mt-5 w-full max-w-[360px] rounded-2xl border border-[#e5e7eb] bg-[#f9fafb] p-5">
-		<h2 class="text-[16px] font-bold tracking-tight text-[#111827]">AI 튜터 설정</h2>
-		<p class="mt-1 text-[13px] leading-snug text-[#4b5563]">
-			대화 시작 전에 아래 항목을 선택하세요. 대화 중에는 변경할 수 없습니다.
-		</p>
-
-		<div class="mt-5">
-			<p class="text-[14px] font-semibold text-[#1f2937]">난이도 · 레벨</p>
-			<p class="mt-0.5 text-[12px] text-[#6b7280]">튜터가 쓰는 어휘와 문장 길이를 조절합니다.</p>
-			<div class="mt-2.5 flex flex-wrap gap-2">
-				{#each levels as lv}
-					<button
-						type="button"
-						disabled={settingsLocked}
-						class="rounded-full px-4 py-2 text-[13px] font-semibold {level === lv
-							? 'bg-[#4a90e2] text-white shadow-sm'
-							: 'bg-white text-[#374151] ring-1 ring-[#d1d5db]'}"
-						onclick={() => {
-							level = lv;
-							persistPrefs();
-						}}
-					>
-						{LEVEL_LABELS[lv]}
-					</button>
-				{/each}
-			</div>
-			<p class="mt-2 text-[12px] font-medium text-[#6b7280]">{LEVEL_HINTS[level]}</p>
-		</div>
-
-		<div class="mt-5 border-t border-[#e5e7eb] pt-5">
-			<p class="text-[14px] font-semibold text-[#1f2937]">대화 언어</p>
-			<p class="mt-0.5 text-[12px] text-[#6b7280]">튜터가 주로 사용할 언어 모드를 고릅니다.</p>
-			<div class="mt-2.5 flex flex-wrap gap-2">
-				{#each languageModes as mode}
-					<button
-						type="button"
-						disabled={settingsLocked}
-						class="rounded-full px-4 py-2 text-[13px] font-semibold {languageMode === mode
-							? 'bg-[#8b5cf6] text-white shadow-sm'
-							: 'bg-white text-[#374151] ring-1 ring-[#d1d5db]'}"
-						onclick={() => {
-							languageMode = mode;
-							persistPrefs();
-						}}
-					>
-						{LANGUAGE_META[mode].label}
-					</button>
-				{/each}
-			</div>
-			<p class="mt-2 text-[12px] font-medium text-[#6b7280]">{LANGUAGE_META[languageMode].hint}</p>
-		</div>
-
-		<div class="mt-5 border-t border-[#e5e7eb] pt-5">
-			<p class="text-[14px] font-semibold text-[#1f2937]">말 끊김 · 턴 감지 (VAD)</p>
-			<p class="mt-0.5 text-[12px] text-[#6b7280]">말을 멈췄을 때 튜터가 얼마나 빨리 답할지 정합니다.</p>
-			<div class="mt-2.5 flex flex-wrap gap-2">
-				{#each vadPresets as preset}
-					<button
-						type="button"
-						disabled={settingsLocked}
-						class="rounded-full px-4 py-2 text-[13px] font-semibold {vadPreset === preset
-							? 'bg-[#22c55e] text-white shadow-sm'
-							: 'bg-white text-[#374151] ring-1 ring-[#d1d5db]'}"
-						onclick={() => {
-							vadPreset = preset;
-							persistPrefs();
-						}}
-					>
-						{VAD_PRESET_META[preset].label}
-					</button>
-				{/each}
-			</div>
-			<p class="mt-2 text-[12px] font-medium text-[#6b7280]">{VAD_PRESET_META[vadPreset].hint}</p>
-		</div>
-	</div>
 
 	<div
 		class="mx-auto mt-6 w-full max-w-[360px] rounded-2xl border p-4 {apiLinkState === 'connected'
@@ -1030,8 +1199,8 @@
 				onclick={() => (showDebug = !showDebug)}
 			>
 				{showDebug ? '디버그 닫기' : '디버그 보기'}
-				{#if debugErrorCount > 0 && !showDebug}
-					<span class="ml-1 text-[12px] text-red-500">({debugErrorCount})</span>
+				{#if !showDebug && sessionDebugCount > 0}
+					<span class="ml-1 text-[12px] font-medium text-[#64748b]">({sessionDebugCount})</span>
 				{/if}
 			</button>
 		</div>
@@ -1105,11 +1274,11 @@
 		></canvas>
 	</div>
 
-	<div class="mx-auto mt-6 w-full max-w-[360px]">
-		<nav class="flex border-b border-[#e5e7eb]" aria-label="대화 보기">
+	<div class="mx-auto mt-6 w-full max-w-[360px] overflow-hidden rounded-2xl bg-[#f0f2f8] shadow-sm ring-1 ring-[#e5e7eb]">
+		<nav class="flex border-b border-[#e5e7eb] bg-white" aria-label="대화 보기">
 			<button
 				type="button"
-				class="flex-1 border-b-2 px-2 py-2.5 text-[14px] font-semibold transition {chatPanelTab === 'current'
+				class="flex-1 border-b-2 px-1 py-3 text-[13px] font-semibold transition {chatPanelTab === 'current'
 					? 'border-[#4a90e2] text-[#4a90e2]'
 					: 'border-transparent text-[#6b7280] hover:text-[#374151]'}"
 				onclick={() => (chatPanelTab = 'current')}
@@ -1118,7 +1287,7 @@
 			</button>
 			<button
 				type="button"
-				class="flex-1 border-b-2 px-2 py-2.5 text-[14px] font-semibold transition {chatPanelTab === 'history'
+				class="flex-1 border-b-2 px-1 py-3 text-[13px] font-semibold transition {chatPanelTab === 'history'
 					? 'border-[#4a90e2] text-[#4a90e2]'
 					: 'border-transparent text-[#6b7280] hover:text-[#374151]'}"
 				onclick={() => {
@@ -1128,12 +1297,23 @@
 			>
 				대화 기록
 			</button>
+			<button
+				type="button"
+				class="flex-1 border-b-2 px-1 py-3 text-[13px] font-semibold transition {chatPanelTab === 'settings'
+					? 'border-[#4a90e2] text-[#4a90e2]'
+					: 'border-transparent text-[#6b7280] hover:text-[#374151]'}"
+				onclick={() => (chatPanelTab = 'settings')}
+			>
+				AI 설정
+			</button>
 		</nav>
 
 		<div
-			class="mt-4 rounded-xl border p-4 shadow-sm {chatPanelTab === 'history'
-				? 'border-[#b8d4f0] bg-[#eef6ff]'
-				: 'border-[#e5e7eb] bg-white'}"
+			class="p-3 {chatPanelTab === 'history'
+				? 'bg-[#eef6ff]'
+				: chatPanelTab === 'settings'
+					? 'bg-[#f0f2f8]'
+					: 'bg-white'}"
 		>
 			{#if chatPanelTab === 'current'}
 				<div class="mb-3 flex items-center justify-between gap-2">
@@ -1149,9 +1329,22 @@
 					{/if}
 				</div>
 				{#if viewingSavedAt}
-					<p class="mb-3 rounded-lg bg-[#eff6ff] px-3 py-2 text-[12px] text-[#1e40af]">
-						{formatSavedDateLong(viewingSavedAt)}에 저장된 세션을 보고 있습니다.
-					</p>
+					<div class="mb-3 rounded-lg bg-[#eff6ff] px-3 py-2.5 text-[12px] text-[#1e40af]">
+						<p>{formatSavedDateLong(viewingSavedAt)}에 저장된 세션을 보고 있습니다.</p>
+						{#if viewingAiSettings}
+							<div class="mt-2 flex flex-wrap gap-1.5">
+								<span
+									class="inline-flex items-center gap-1 rounded-full bg-white/80 px-2 py-0.5 text-[11px] font-semibold text-[#1d4ed8]"
+								>
+									<span aria-hidden="true">{viewingAiSettings.personality.emoji}</span>
+									{viewingAiSettings.personality.title}
+								</span>
+								<span class="rounded-full bg-white/60 px-2 py-0.5 text-[11px] text-[#334155]">
+									{viewingAiSettings.levelLabel} · {viewingAiSettings.langLabel}
+								</span>
+							</div>
+						{/if}
+					</div>
 				{/if}
 				<div
 					bind:this={chatScrollEl}
@@ -1161,11 +1354,15 @@
 						savedAt={viewingSavedAt || sessionStartedAt}
 						dialogMessages={messages}
 						systemMessages={sessionSystemMessages}
+						liveUserModel={viewingSavedAt ? '' : TRANSCRIPTION_MODEL}
+						liveAssistantModel={viewingSavedAt ? '' : REALTIME_MODEL}
+						pendingAssistantText={viewingSavedAt ? '' : pendingAssistant}
 					/>
 				</div>
-			{:else}
+			{:else if chatPanelTab === 'history'}
 				<ConversationHistoryPanel
 					{history}
+					exchange={usdKrw}
 					loading={historyLoading}
 					error={historyError}
 					expandedIds={expandedHistoryIds}
@@ -1173,6 +1370,40 @@
 					onToggleExpand={toggleHistoryExpand}
 					onEdit={loadHistoryEntry}
 					onDelete={deleteHistoryEntry}
+				/>
+			{:else}
+				<AiTeacherSettingsPanel
+					settingsLocked={settingsLocked}
+					{level}
+					{languageMode}
+					{vadPreset}
+					{teacherPersonality}
+					customPromptText={activeCustomPrompt}
+					showCustomEditor={showCustomPromptEditor}
+					previewText={settingsPreviewText}
+					onSelectPersonality={selectTeacherPersonality}
+					onOpenCustom={openCustomPromptEditor}
+					onCustomPromptChange={updateCustomPrompt}
+					onReset={resetTeacherSettings}
+					onLevelChange={(lv) => {
+						level = lv;
+						persistPrefs();
+					}}
+					onLanguageModeChange={(mode) => {
+						languageMode = mode;
+						persistPrefs();
+					}}
+					onVadChange={(preset) => {
+						vadPreset = preset;
+						persistPrefs();
+					}}
+					savedPrompts={savedPromptsForMode}
+					promptCloudStatus={promptCloudStatus}
+					promptCloudError={promptCloudError}
+					onSaveNamedPrompt={saveNamedPromptToCloud}
+					onLoadSavedPrompt={loadSavedPromptFromCloud}
+					onDeleteSavedPrompt={deleteSavedPromptFromCloud}
+					onRefreshSavedPrompts={loadUserPromptsFromCloud}
 				/>
 			{/if}
 		</div>

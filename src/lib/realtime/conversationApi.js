@@ -13,7 +13,9 @@ async function readJson(res) {
 	}
 }
 
-/** @returns {Promise<SavedConversation[]>} */
+/**
+ * @returns {Promise<{ conversations: SavedConversation[], exchange: { rate: number, date: string } | null }>}
+ */
 export async function fetchConversations() {
 	const res = await fetch('/api/conversations');
 	const { json, raw } = await readJson(res);
@@ -21,7 +23,12 @@ export async function fetchConversations() {
 		const msg = json?.error || raw || '대화 기록을 불러오지 못했습니다.';
 		throw new Error(typeof msg === 'string' ? msg : '대화 기록을 불러오지 못했습니다.');
 	}
-	return Array.isArray(json?.conversations) ? json.conversations : [];
+	const exchange = json?.exchange;
+	const rate = Number(exchange?.rate);
+	return {
+		conversations: Array.isArray(json?.conversations) ? json.conversations : [],
+		exchange: Number.isFinite(rate) && rate > 0 ? { rate, date: String(exchange?.date || '') } : null
+	};
 }
 
 /** @param {ConversationInsertPayload} payload @returns {Promise<SavedConversation>} */

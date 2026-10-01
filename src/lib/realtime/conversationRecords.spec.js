@@ -47,19 +47,36 @@ describe('conversationRecords', () => {
 			level: saved.level,
 			vadPreset: saved.vadPreset,
 			languageMode: saved.languageMode,
+			teacherPersonality: 'strict',
 			messages: saved.messages
 		});
 		expect(insert.user_id).toBe('user-1');
 		expect(insert.vad_preset).toBe('balanced');
+		expect(insert.teacher_personality).toBe('strict');
 	});
 
 	it('splitSessionMessages separates dialog and system', () => {
 		const { dialog, system } = splitSessionMessages([
-			{ role: 'user', text: 'x' },
+			{
+				role: 'user',
+				text: 'x',
+				turnUsage: {
+					inputModel: 'whisper-1',
+					outputModel: 'whisper-1',
+					inputTextTokens: 0,
+					inputAudioTokens: 10,
+					inputImageTokens: 0,
+					cachedTextTokens: 0,
+					cachedAudioTokens: 0,
+					outputTextTokens: 4,
+					outputAudioTokens: 0
+				}
+			},
 			{ role: 'system', text: 'y' },
 			{ role: 'assistant', text: 'z' }
 		]);
 		expect(dialog).toHaveLength(2);
+		expect(dialog[0].turnUsage?.inputModel).toBe('whisper-1');
 		expect(system).toHaveLength(1);
 	});
 });
