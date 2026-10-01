@@ -2,7 +2,7 @@
 	import RealtimeChat from '$lib/components/RealtimeChat.svelte';
 </script>
 
-<main class="min-h-screen bg-[#eef1f8] px-4 py-10">
+<main class="px-4 py-10">
 	<section class="mx-auto w-full max-w-md">
 		<div
 			class="overflow-hidden rounded-[28px] bg-white px-8 pb-10 pt-9 shadow-[0_20px_50px_rgba(15,23,42,0.08)]"

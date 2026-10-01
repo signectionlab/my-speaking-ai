@@ -1,5 +1,9 @@
 <script>
 	import SpeakingApp from '$lib/components/SpeakingApp.svelte';
+
+	let { data } = $props();
 </script>
 
-<SpeakingApp />
+{#if data.user}
+	<SpeakingApp />
+{/if}

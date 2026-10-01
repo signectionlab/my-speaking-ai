@@ -6,13 +6,17 @@
 		VAD_PRESET_META,
 		LANGUAGE_META
 	} from '$lib/realtime/tutorLevels.js';
+	import ChatTranscriptView from '$lib/components/ChatTranscriptView.svelte';
+	import ConversationHistoryPanel from '$lib/components/ConversationHistoryPanel.svelte';
+	import { createConversation, deleteConversation, fetchConversations } from '$lib/realtime/conversationApi.js';
 	import {
-		loadConversations,
-		saveConversation,
-		loadPrefs,
-		savePrefs,
-		downloadConversationJson
-	} from '$lib/realtime/conversationStorage.js';
+		buildConversationInsertPayload,
+		createUserSystemMessage,
+		filterUserFacingSystemMessages,
+		formatSavedDateLong,
+		splitSessionMessages
+	} from '$lib/realtime/conversationRecords.js';
+	import { loadPrefs, savePrefs } from '$lib/realtime/conversationStorage.js';
 	import {
 		SESSION_CLOSE_TIMEOUT_MS,
 		verifyLocalTeardown
@@ -51,8 +55,19 @@
 	/** @type {Array<{ role: 'user' | 'assistant', text: string }>} */
 	let messages = $state([]);
 	let history = $state([]);
-	let showHistory = $state(false);
+	/** @type {'current' | 'history'} */
+	let chatPanelTab = $state('current');
+	/** @type {Record<string, boolean>} */
+	let expandedHistoryIds = $state({});
+	let historyLoading = $state(false);
+	let historyError = $state('');
+	let saveError = $state('');
 	let lastSavedId = $state('');
+	let viewingSavedAt = $state('');
+	let sessionStartedAt = $state('');
+	let sessionDebugLogStart = $state(0);
+	/** @type {import('$lib/realtime/conversationRecords.js').ChatMessage[]} */
+	let sessionSystemMessages = $state([]);
 
 	/** @type {HTMLDivElement | null} */
 	let chatScrollEl = $state(null);
@@ -100,7 +115,7 @@
 		if (prefs.languageMode === 'english' || prefs.languageMode === 'korean' || prefs.languageMode === 'mixed') {
 			languageMode = prefs.languageMode;
 		}
-		history = loadConversations();
+		void refreshHistory();
 		logDebug('info', '디버그 패널 준비됨', { href: location.href });
 		window.addEventListener('resize', handleResize);
 		return () => window.removeEventListener('resize', handleResize);
@@ -429,26 +444,86 @@
 		finalizeCleanup();
 	}
 
-	function persistCurrentChat() {
-		if (messages.length === 0) return;
-		const id = crypto.randomUUID().slice(0, 8);
-		saveConversation({
-			id,
-			savedAt: new Date().toISOString(),
+	/** @param {string} body */
+	function appendSessionSystemMessage(body) {
+		sessionSystemMessages = [
+			...sessionSystemMessages,
+			createUserSystemMessage(new Date().toISOString(), body)
+		];
+	}
+
+	async function refreshHistory() {
+		historyLoading = true;
+		historyError = '';
+		try {
+			history = await fetchConversations();
+		} catch (err) {
+			history = [];
+			historyError = err instanceof Error ? err.message : '대화 기록을 불러오지 못했습니다.';
+			logDebug('error', '대화 기록 불러오기 실패', historyError);
+		} finally {
+			historyLoading = false;
+		}
+	}
+
+	/** @param {string} id */
+	function toggleHistoryExpand(id) {
+		expandedHistoryIds = { ...expandedHistoryIds, [id]: !expandedHistoryIds[id] };
+	}
+
+	/** @param {import('$lib/realtime/conversationRecords.js').SavedConversation} entry */
+	async function deleteHistoryEntry(entry) {
+		if (!confirm('이 대화 기록을 삭제할까요?')) return;
+		historyError = '';
+		try {
+			await deleteConversation(entry.id);
+			if (lastSavedId === entry.id) clearSavedSessionView();
+			const next = { ...expandedHistoryIds };
+			delete next[entry.id];
+			expandedHistoryIds = next;
+			await refreshHistory();
+		} catch (err) {
+			historyError = err instanceof Error ? err.message : '대화 기록을 삭제하지 못했습니다.';
+		}
+	}
+
+	/** @returns {Promise<boolean>} */
+	async function persistCurrentChat() {
+		const systemToSave = filterUserFacingSystemMessages(sessionSystemMessages);
+		if (messages.length === 0 && systemToSave.length === 0) return false;
+
+		saveError = '';
+		const payload = buildConversationInsertPayload({
+			sessionStartedAt: sessionStartedAt || new Date().toISOString(),
 			level,
 			vadPreset,
 			languageMode,
-			messages: [...messages]
+			dialogMessages: messages,
+			systemMessages: systemToSave
 		});
-		history = loadConversations();
-		lastSavedId = id;
+
+		try {
+			const saved = await createConversation(payload);
+			lastSavedId = saved.id;
+			await refreshHistory();
+			logDebug('ok', '대화 세션 저장됨', { id: saved.id, savedAt: payload.savedAt });
+			return true;
+		} catch (err) {
+			saveError = err instanceof Error ? err.message : '대화 저장에 실패했습니다.';
+			logDebug('error', '대화 세션 저장 실패', saveError);
+			return false;
+		}
 	}
 
 	async function start() {
 		if (isSessionActive) return;
 		errorMessage = '';
 		messages = [];
+		sessionSystemMessages = [];
+		viewingSavedAt = '';
 		lastSavedId = '';
+		sessionStartedAt = new Date().toISOString();
+		sessionDebugLogStart = debugLogs.length;
 		assistantIndex = -1;
 		pendingAssistant = '';
 		persistPrefs();
@@ -561,9 +636,11 @@
 			dc = channel;
 			channel.addEventListener('open', () => {
 				logDebug('ok', 'oai-events 데이터 채널 open');
+				if (!sessionStartedAt) sessionStartedAt = new Date().toISOString();
 				shutdownState = 'active';
 				status = 'live';
 				statusText = '대화 중 — 말씀해 주세요';
+				appendSessionSystemMessage('새로운 영어회화 세션이 시작되었습니다.');
 			});
 			channel.addEventListener('error', () => {
 				logDebug('error', 'oai-events 데이터 채널 error');
@@ -591,6 +668,10 @@
 					shutdownState = 'uncertain';
 					shutdownMessage = '연결이 끊겼습니다. OpenAI 사용량을 확인해 주세요.';
 					statusText = '연결이 예기치 않게 종료되었습니다.';
+					appendSessionSystemMessage(
+						'🛑 연결 해제됨 - 연결이 예기치 않게 끊겼습니다. API 통신과 오디오가 중단되었습니다.'
+					);
+					void persistCurrentChat();
 					finalizeCleanup();
 				}
 			});
@@ -644,9 +725,9 @@
 		statusText = 'API 세션 종료 중… (과금 중단 요청)';
 
 		stopMicSend();
-		persistCurrentChat();
 
 		let serverAck = false;
+		let saved = false;
 		if (dc?.readyState === 'open') {
 			const closedPromise = new Promise((resolve) => {
 				resolveSessionClosed = resolve;
@@ -698,11 +779,16 @@
 		}
 
 		finalizeCleanup();
+		appendSessionSystemMessage(
+			'🛑 연결 해제됨 - 모든 API 통신과 오디오가 즉시 중단되었습니다.'
+		);
+		saved = await persistCurrentChat();
 		status = 'idle';
 		statusText = serverAck
 			? '종료 완료 · API 세션 닫힘'
 			: '연결 종료 · 서버 확인 미수신';
-		if (lastSavedId) statusText += ' · 대화 저장됨';
+		if (saved) statusText += ' · 대화 저장됨';
+		else if (messages.length > 0 && saveError) statusText += ' · 저장 실패';
 
 		stopInProgress = false;
 	}
@@ -712,8 +798,10 @@
 		else if (status === 'idle' || status === 'error') void start();
 	}
 
-	function loadHistoryEntry(/** @type {import('$lib/realtime/conversationStorage.js').SavedConversation} */ entry) {
-		messages = [...entry.messages];
+	function loadHistoryEntry(/** @type {import('$lib/realtime/conversationRecords.js').SavedConversation} */ entry) {
+		const { dialog, system } = splitSessionMessages(entry.messages);
+		messages = [...dialog];
+		sessionSystemMessages = filterUserFacingSystemMessages(system);
 		level =
 			entry.level === 'intermediate' || entry.level === 'advanced' ? entry.level : 'beginner';
 		vadPreset =
@@ -722,22 +810,18 @@
 			entry.languageMode === 'english' || entry.languageMode === 'korean' || entry.languageMode === 'mixed'
 				? entry.languageMode
 				: 'english';
-		showHistory = false;
-		statusText = '저장된 대화를 불러왔습니다.';
+		chatPanelTab = 'current';
+		viewingSavedAt = entry.savedAt;
+		lastSavedId = entry.id;
+		statusText = `${formatSavedDateLong(entry.savedAt)} 세션 기록을 불러왔습니다.`;
 		scrollChatToBottom();
 	}
 
-	function formatSavedDate(/** @type {string} */ iso) {
-		try {
-			return new Intl.DateTimeFormat('ko-KR', {
-				month: 'short',
-				day: 'numeric',
-				hour: '2-digit',
-				minute: '2-digit'
-			}).format(new Date(iso));
-		} catch {
-			return iso;
-		}
+	function clearSavedSessionView() {
+		viewingSavedAt = '';
+		sessionSystemMessages = [];
+		messages = [];
+		statusText = 'AI 튜터 설정 후 대화를 시작해 주세요.';
 	}
 
 	$effect(() => {
@@ -1022,69 +1106,81 @@
 	</div>
 
 	<div class="mx-auto mt-6 w-full max-w-[360px]">
-		<p class="mb-2 text-[14px] font-semibold text-[#374151]">대화 기록</p>
+		<nav class="flex border-b border-[#e5e7eb]" aria-label="대화 보기">
+			<button
+				type="button"
+				class="flex-1 border-b-2 px-2 py-2.5 text-[14px] font-semibold transition {chatPanelTab === 'current'
+					? 'border-[#4a90e2] text-[#4a90e2]'
+					: 'border-transparent text-[#6b7280] hover:text-[#374151]'}"
+				onclick={() => (chatPanelTab = 'current')}
+			>
+				현재 대화
+			</button>
+			<button
+				type="button"
+				class="flex-1 border-b-2 px-2 py-2.5 text-[14px] font-semibold transition {chatPanelTab === 'history'
+					? 'border-[#4a90e2] text-[#4a90e2]'
+					: 'border-transparent text-[#6b7280] hover:text-[#374151]'}"
+				onclick={() => {
+					chatPanelTab = 'history';
+					void refreshHistory();
+				}}
+			>
+				대화 기록
+			</button>
+		</nav>
+
 		<div
-			bind:this={chatScrollEl}
-			class="flex max-h-[300px] min-h-[200px] flex-col gap-3 overflow-y-auto rounded-2xl border border-[#eee] bg-[#fafafa] p-4"
+			class="mt-4 rounded-xl border p-4 shadow-sm {chatPanelTab === 'history'
+				? 'border-[#b8d4f0] bg-[#eef6ff]'
+				: 'border-[#e5e7eb] bg-white'}"
 		>
-			{#if messages.length === 0}
-				<p class="my-auto text-center text-[13px] text-[#999999]">
-					대화가 시작되면 말한 순서대로 여기에 표시됩니다.
-				</p>
-			{:else}
-				{#each messages as m, i (i)}
-					<article class="flex gap-2">
-						<span
-							class="mt-0.5 shrink-0 text-[10px] font-bold uppercase tracking-wide {m.role === 'user'
-								? 'text-[#4a90e2]'
-								: 'text-[#22c55e]'}"
-						>
-							{m.role === 'user' ? '나' : '튜터'}
-						</span>
-						<p class="min-w-0 flex-1 text-[13px] leading-relaxed text-[#333333]">{m.text}</p>
-					</article>
-				{/each}
-			{/if}
-		</div>
-	</div>
-
-	<div class="mx-auto mt-6 flex w-full max-w-[360px] flex-col items-center gap-2">
-		<button
-			type="button"
-			class="text-sm font-medium text-[#4a90e2] underline-offset-2 hover:underline"
-			onclick={() => (showHistory = !showHistory)}
-		>
-			{showHistory ? '기록 접기' : `저장된 대화 (${history.length})`}
-		</button>
-	</div>
-
-	{#if showHistory}
-		<div class="mx-auto mt-3 w-full max-w-[360px] space-y-2">
-			{#if history.length === 0}
-				<p class="text-center text-[12px] text-[#999999]">저장된 대화가 없습니다.</p>
-			{:else}
-				{#each history as entry}
-					<div
-						class="flex items-center justify-between gap-2 rounded-xl border border-[#eee] bg-[#fafafa] px-3 py-2"
-					>
-						<button type="button" class="min-w-0 flex-1 text-left" onclick={() => loadHistoryEntry(entry)}>
-							<span class="block truncate text-[13px] font-medium text-[#333333]">
-								{formatSavedDate(entry.savedAt)} · {LEVEL_LABELS[entry.level] ?? entry.level}
-							</span>
-							<span class="block text-[11px] text-[#888888]">{entry.messages.length}개 메시지</span>
-						</button>
+			{#if chatPanelTab === 'current'}
+				<div class="mb-3 flex items-center justify-between gap-2">
+					<p class="text-[16px] font-bold text-[#111827]">현재 대화</p>
+					{#if viewingSavedAt}
 						<button
 							type="button"
-							class="shrink-0 rounded-lg px-2 py-1 text-[11px] ring-1 ring-[#ddd]"
-							onclick={() => downloadConversationJson(entry)}
+							class="shrink-0 text-[11px] font-medium text-[#4a90e2] underline-offset-2 hover:underline"
+							onclick={clearSavedSessionView}
 						>
-							JSON
+							화면 지우기
 						</button>
-					</div>
-				{/each}
+					{/if}
+				</div>
+				{#if viewingSavedAt}
+					<p class="mb-3 rounded-lg bg-[#eff6ff] px-3 py-2 text-[12px] text-[#1e40af]">
+						{formatSavedDateLong(viewingSavedAt)}에 저장된 세션을 보고 있습니다.
+					</p>
+				{/if}
+				<div
+					bind:this={chatScrollEl}
+					class="max-h-[420px] min-h-[200px] overflow-y-auto pr-1"
+				>
+					<ChatTranscriptView
+						savedAt={viewingSavedAt || sessionStartedAt}
+						dialogMessages={messages}
+						systemMessages={sessionSystemMessages}
+					/>
+				</div>
+			{:else}
+				<ConversationHistoryPanel
+					{history}
+					loading={historyLoading}
+					error={historyError}
+					expandedIds={expandedHistoryIds}
+					onRefresh={refreshHistory}
+					onToggleExpand={toggleHistoryExpand}
+					onEdit={loadHistoryEntry}
+					onDelete={deleteHistoryEntry}
+				/>
 			{/if}
 		</div>
-	{/if}
+
+		{#if saveError}
+			<p class="mt-2 text-center text-[12px] text-red-600" role="alert">{saveError}</p>
+		{/if}
+	</div>
 
 	<audio bind:this={audioEl} class="hidden" autoplay></audio>
 {/snippet}

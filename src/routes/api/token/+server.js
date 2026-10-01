@@ -41,7 +41,11 @@ function fail(status, message, extra = {}) {
 	);
 }
 
-export async function POST({ request }) {
+export async function POST({ request, locals }) {
+	if (!locals.user) {
+		return fail(401, '로그인이 필요합니다.');
+	}
+
 	const apiKey =
 		env.OPENAI_API_KEY ??
 		(typeof process !== 'undefined' ? process.env.OPENAI_API_KEY : undefined);
